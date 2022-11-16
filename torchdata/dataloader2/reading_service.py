@@ -8,11 +8,13 @@
 import functools
 import multiprocessing as mp
 import random
+import warnings
 
 from abc import ABC, abstractmethod
+from collections import deque
 
 from datetime import timedelta
-from typing import Callable, List, Optional
+from typing import Callable, Deque, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -120,11 +122,12 @@ class _IterateQueueDataPipes(IterDataPipe):
 
     def __init__(self, datapipes):
         # TODO(VitalyFedyunin): Consider combining _IterateQueueDataPipes and QueueWrapper
-        # into one class, which supports any number of queues.
-        self.datapipes = datapipes
-        for dp in self.datapipes:
+        #                       into one class, which supports any number of queues.
+        for dp in datapipes:
             if not isinstance(dp, communication.iter.QueueWrapper):
                 raise Exception("Source datapipes should be an instance of iter.QueueWrapper")
+        self.datapipes = datapipes
+        self.res_buffers: List[Deque] = [deque() for _ in range(len(datapipes))]
 
     def __iter__(self):
         total_pipes = len(self.datapipes)
@@ -137,7 +140,11 @@ class _IterateQueueDataPipes(IterDataPipe):
         while cnt_disabled_pipes < total_pipes:
             for idx in range(total_pipes):
                 if not disabled_pipe[idx]:
-                    response = self.datapipes[idx].protocol.get_response_next(block=True)
+                    # Check if buffer of the DataPipe is empty, if not, yield one before requesting next
+                    if len(self.res_buffers[idx]):
+                        response = self.res_buffers[idx].popleft()
+                    else:
+                        response = self.datapipes[idx].protocol.get_response_next(block=True)
                     if isinstance(response, communication.messages.StopIterationResponse):
                         disabled_pipe[idx] = True
                         cnt_disabled_pipes += 1
@@ -146,7 +153,8 @@ class _IterateQueueDataPipes(IterDataPipe):
                         raise communication.iter.InvalidStateResetRequired
                     if isinstance(response, communication.messages.TerminateResponse):
                         raise communication.iter.TerminateRequired
-                    self.datapipes[idx].protocol.request_next()
+                    if len(self.res_buffers[idx]) == 0:  # Only request if buffer is empty
+                        self.datapipes[idx].protocol.request_next()
                     yield response.value
 
     def reset(self):
@@ -163,6 +171,26 @@ class _IterateQueueDataPipes(IterDataPipe):
             dp.protocol.discard_existing_request()
         for dp in self.datapipes:
             dp.protocol.request_reset_epoch(*args)
+
+    def request_pause(self):
+        # Store results of pending requests
+        for idx, dp in enumerate(self.datapipes):
+            if dp.protocol.waiting_for_response():
+                res = dp.protocol.get_response_next(block=True)
+                self.res_buffers[idx].append(res)
+        for i, dp in enumerate(self.datapipes):
+            print(f"Calling pause on worker {i}")
+            dp.pause()
+            print(f"`pause` is done for worker {i}")
+
+    def request_resume(self):
+        for i, dp in enumerate(self.datapipes):
+            if dp.protocol.waiting_for_response():
+                # TODO: Might need to see what request has been sent and wait here, see notes in test
+                print(f"Worker {i} is waiting fore response in request_resume")
+            print(f"Calling resume on worker {i}")
+            dp.resume()
+            print(f"`request_resume` is done on worker {i}")
 
 
 class PrototypeMultiProcessingReadingService(ReadingServiceInterface):
@@ -346,6 +374,40 @@ class PrototypeMultiProcessingReadingService(ReadingServiceInterface):
         if self._pg is not None:
             dist.destroy_process_group(self._pg)
             self._pg = None
+
+    def _pause(self):
+        """
+        Pauses DataPipes' activities such as prefetching, in order to collect state.
+        """
+        if self.prefetch_mainloop > 0 and self.num_workers > 0:
+            # Stop prefetching first
+            self.end_datapipe.pause()  # type: ignore[union-attr]
+            end_datapipe: DataPipe = self.end_datapipe.source_datapipe  # type: ignore[union-attr]
+        else:
+            end_datapipe = self.end_datapipe  # type: ignore[assignment]
+        if self.num_workers > 0:
+            end_datapipe.request_pause()
+        else:
+            warnings.warn("If you would like to use `pause`, please use more than 0 worker.")
+
+    def _resume(self):
+        """
+        Resumes DataPipes' activities. This is required to be called after `_pause` before
+        the DataLoader can keep yielding elements.
+        """
+        if self.prefetch_mainloop > 0:
+            end_datapipe: DataPipe = self.end_datapipe.source_datapipe  # type: ignore[union-attr]
+        else:
+            end_datapipe = self.end_datapipe  # type: ignore[assignment]
+        if self.num_workers > 0:
+            end_datapipe.request_resume()
+        else:
+            warnings.warn("If you would like to use `resume`, please use more than 0 worker.")
+        print("`rs._resume`: done calling `request_resume` (on workers)", flush=True)
+        if self.prefetch_mainloop > 0 and self.num_workers > 0:
+            print("`rs._resume`: calling `resume` on prefetch_mainloop", flush=True)
+            print(f"Type: {type(self.end_datapipe)}")
+            self.end_datapipe.resume()  # type: ignore[union-attr]
 
 
 class MultiProcessingReadingService(ReadingServiceInterface):

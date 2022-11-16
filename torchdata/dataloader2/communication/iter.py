@@ -9,6 +9,7 @@ import types
 
 from torch.utils.data import IterDataPipe
 from torchdata.dataloader2 import communication
+from torchdata.dataloader2.graph import traverse_dps
 
 DEFAULT_NON_BLOCKING_SLEEP = 0.001
 
@@ -130,6 +131,7 @@ def DataPipeBehindQueues(source_datapipe, protocol, blocking_request_get=False, 
         try:
             # TODO: Non-blocking call is extremely slow here for python.mp, need to figure out a good workaround
             request = protocol.get_new_request(block=blocking_request_get)
+            print(f"DataPipeBehindQueues got new request: {request}")
         except communication.protocol.EmptyQueue:
             yield True
             continue
@@ -143,12 +145,38 @@ def DataPipeBehindQueues(source_datapipe, protocol, blocking_request_get=False, 
             source_datapipe.reset_iterator()
             protocol.response_reset_iterator()
 
+        elif isinstance(request, communication.messages.PauseRequest):
+            print("Processing PauseRequest")
+            graph = traverse_dps(source_datapipe)
+            for dp, _ in graph.values():
+                if hasattr(dp, "pause") and callable(dp.pause):
+                    dp.pause()
+            print("About to return response_pause", flush=True)
+            protocol.response_pause()
+            print("PauseResponse returned", flush=True)
+            yield True  # Return control
+
+        elif isinstance(request, communication.messages.ResumeRequest):
+            print("Processing ResumeRequest")
+            graph = traverse_dps(source_datapipe)
+            for dp, _ in graph.values():
+                if hasattr(dp, "resume") and callable(dp.resume):
+                    dp.resume()
+            print("About to return response_resume", flush=True)
+            protocol.response_resume()
+            print("ResumeResponse returned", flush=True)
+            yield True  # Return control
+
         elif isinstance(request, communication.messages.TerminateRequest):
             forever = False
             protocol.response_terminate()
 
         elif isinstance(request, communication.messages.GetNextRequest):
             while forever:
+                if protocol._pause:
+                    raise RuntimeError(
+                        "Cannot `GetNext` after `Pause` has been called. " "`Resume` must be called first."
+                    )
                 try:
                     value = source_datapipe.nonblocking_next()
                 except NotAvailable:
@@ -190,6 +218,26 @@ class QueueWrapper(NonBlocking):
         while True:
             try:
                 self.protocol.get_response_reset_iterator()
+                break
+            except communication.protocol.EmptyQueue:
+                if NonBlocking.not_available_hook is not None:
+                    NonBlocking.not_available_hook()
+
+    def pause(self):
+        self.protocol.request_pause()
+        while True:
+            try:
+                self.protocol.get_response_pause()
+                break
+            except communication.protocol.EmptyQueue:
+                if NonBlocking.not_available_hook is not None:
+                    NonBlocking.not_available_hook()
+
+    def resume(self):
+        self.protocol.request_resume()
+        while True:
+            try:
+                self.protocol.get_response_resume()
                 break
             except communication.protocol.EmptyQueue:
                 if NonBlocking.not_available_hook is not None:
